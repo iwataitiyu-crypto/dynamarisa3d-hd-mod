@@ -1,0 +1,16 @@
+# build outputs
+out/
+release/
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# python
+__pycache__/
+*.pyc
+
+# runtime files the mod writes into the game folder
+*.log
+capture*/
+shaderdump/
