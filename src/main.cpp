@@ -597,17 +597,64 @@ static void captureFrame(IDirect3DDevice9* dev) {
     }
 }
 
+// ---------------------------------------------------------------- exe のバージョンごとの情報
+// 照準の慣性除去と照準の細かさは exe の機械語やメモリ配置に依存する。公式パッチ (v1.02) で
+// カメラ処理と input オブジェクトの配置が変わったので、既知のバージョンごとに情報を持ち、
+// 照準処理の命令の並びが一致したものを使う。どれにも一致しなければこれらの機能は何もしない。
+// アドレスは exe の既定ベース (0x400000) 基準。exe は ASLR 対応なので実際のベースに読み替える。
+//
+// 照準の慣性: カメラ更新処理はマウス/パッドの入力をいったん「未消化の回転量」に溜め、
+// 毎フレーム camera.speed (0.5度) + 残りの一定割合だけを向きに反映して残りを持ち越す。
+// 未消化分が speed 以下のときに全量を反映する分岐へ、ヨー (左右) とピッチ (上下) とも常に飛ばす。
+struct CodePatch { DWORD va; BYTE orig[8]; BYTE repl[8]; };
+struct ExeVersion {
+    const char* name;
+    CodePatch aim[2];     // 照準の慣性除去 (ヨー, ピッチ)
+    DWORD inputPtr;       // input オブジェクトへのポインタを持つグローバル変数
+    DWORD ratioMouse;     // input オブジェクト内の rotateRatioMouse の位置
+};
+static const ExeVersion kExeVersions[] = {
+    { "1.00", {
+        // movss xmm1,[ebx+2D0h] → jmp 00403B45 (未消化分を全量 direction に加算して 0 にする)
+        { 0x403ABA, { 0xF3, 0x0F, 0x10, 0x8B, 0xD0, 0x02, 0x00, 0x00 }, { 0xE9, 0x86, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90 } },
+        // movss xmm1,[ebx+2D0h] → jmp 00403BF4 (未消化分を全量 angle に加算して 0 にする)
+        { 0x403B68, { 0xF3, 0x0F, 0x10, 0x8B, 0xD0, 0x02, 0x00, 0x00 }, { 0xE9, 0x87, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90 } },
+      }, 0x61FA8C, 0x1A4 },
+    { "1.02", {
+        // comiss xmm0,xmm1 / jbe → jmp 00403B51 (未消化分を全量 direction に加算して 0 にする)
+        { 0x403ACE, { 0x0F, 0x2F, 0xC1, 0x76, 0x38, 0x0F, 0x57, 0xD2 }, { 0xE9, 0x7E, 0x00, 0x00, 0x00, 0x0F, 0x57, 0xD2 } },
+        // movss xmm1,[ebx+2D0h] → jmp 00403C02 (未消化分を全量 angle に加算して 0 にする)
+        { 0x403B78, { 0xF3, 0x0F, 0x10, 0x8B, 0xD0, 0x02, 0x00, 0x00 }, { 0xE9, 0x85, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90 } },
+      }, 0x620344, 0x1C4 },
+};
+
+static BYTE* exeAddr(DWORD va) { return (BYTE*)GetModuleHandleA(NULL) + (va - 0x400000); }
+
+// 照準処理の命令の並びから exe のバージョンを判定する
+static const ExeVersion* exeVersion() {
+    static const ExeVersion* found = [] {
+        for (auto& v : kExeVersions) {
+            bool ok = true;
+            for (auto& p : v.aim) ok = ok && !IsBadReadPtr(exeAddr(p.va), 8) && !memcmp(exeAddr(p.va), p.orig, 8);
+            if (ok) { L("exe version %s", v.name); return &v; }
+        }
+        L("unknown exe version: aim patches are disabled");
+        return (const ExeVersion*)nullptr;
+    }();
+    return found;
+}
+
 // ---------------------------------------------------------------- マウス照準の細かさ
 // 照準はマウスの移動量 (カウント) × input.rotateRatioMouse (スクリプトが 0.087 を設定) × rotateRatio × 感度 で回る。
 // 初期設定で 1 カウント約 0.23 度と粗いので、rotateRatioMouse を 1/N にする。スクリプトが値を設定し直したら掛け直す。
 static void applyMouseAimPrecision() {
     if (g_cfg.aimPrecision <= 1) return;
+    const ExeVersion* ver = exeVersion();
+    if (!ver) return;
     static float written = 0;
-    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
-    BYTE** pInput = (BYTE**)(base + (0x61FA8C - 0x400000));  // input オブジェクトへのポインタ
-    BYTE* input = *pInput;
-    if (!input || IsBadWritePtr(input + 0x1A4, 4)) return;
-    float* ratio = (float*)(input + 0x1A4);                     // rotateRatioMouse
+    BYTE* input = *(BYTE**)exeAddr(ver->inputPtr);
+    if (!input || IsBadWritePtr(input + ver->ratioMouse, 4)) return;
+    float* ratio = (float*)(input + ver->ratioMouse);
     if (*ratio > 0 && *ratio != written) {
         float v = *ratio / g_cfg.aimPrecision;
         L("rotateRatioMouse %g -> %g", *ratio, v);
@@ -1171,33 +1218,18 @@ static void installHooks() {
 }
 
 // ---------------------------------------------------------------- 照準の慣性除去 (exe のメモリパッチ)
-// カメラ更新処理 (0x403A5D～) はマウス/パッドの入力をいったん「未消化の回転量」に溜め、
-// 毎フレーム camera.speed (0.5度) + 残りの一定割合だけを向きに反映して残りを持ち越す。
-// これが照準の慣性になっている。未消化分が speed 以下のときに全量を反映する分岐へ常に飛ばす。
-// アドレスは exe の既定ベース (0x400000) 基準。exe は ASLR 対応なので実際のベースに読み替える
-struct CodePatch { DWORD va; BYTE orig[8]; BYTE repl[8]; };
-static const CodePatch kAimPatches[] = {
-    // ヨー: movss xmm1,[ebx+2D0h] → jmp 00403B45 (未消化分を全量 direction に加算して 0 にする)
-    { 0x403ABA, { 0xF3, 0x0F, 0x10, 0x8B, 0xD0, 0x02, 0x00, 0x00 }, { 0xE9, 0x86, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90 } },
-    // ピッチ: movss xmm1,[ebx+2D0h] → jmp 00403BF4 (未消化分を全量 angle に加算して 0 にする)
-    { 0x403B68, { 0xF3, 0x0F, 0x10, 0x8B, 0xD0, 0x02, 0x00, 0x00 }, { 0xE9, 0x87, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90 } },
-};
-
+// 仕組みと書き換え位置は kExeVersions を参照
 static void applyAimPatch() {
-    if (g_cfg.aimSmoothing) return;
-    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
-    auto at = [&](const CodePatch& p) { return base + (p.va - 0x400000); };
-    // 想定した exe でなければ何もしない
-    for (auto& p : kAimPatches)
-        if (IsBadReadPtr(at(p), 8) || memcmp(at(p), p.orig, 8)) { L("aim patch: unexpected code at %08lx, skipped", p.va); return; }
-    for (auto& p : kAimPatches) {
+    const ExeVersion* ver = exeVersion();  // 書き換える前に判定する (書き換え後は元の命令と一致しなくなる)
+    if (g_cfg.aimSmoothing || !ver) return;
+    for (auto& p : ver->aim) {
         DWORD old;
-        VirtualProtect(at(p), 8, PAGE_EXECUTE_READWRITE, &old);
-        memcpy(at(p), p.repl, 8);
-        VirtualProtect(at(p), 8, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), at(p), 8);
+        VirtualProtect(exeAddr(p.va), 8, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(exeAddr(p.va), p.repl, 8);
+        VirtualProtect(exeAddr(p.va), 8, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), exeAddr(p.va), 8);
     }
-    L("aim smoothing removed (exe base %p)", base);
+    L("aim smoothing removed (exe %s, base %p)", ver->name, GetModuleHandleA(NULL));
 }
 
 typedef IDirect3D9* (WINAPI* PFN_Create9)(UINT);
