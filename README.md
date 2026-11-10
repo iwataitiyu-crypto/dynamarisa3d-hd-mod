@@ -47,7 +47,7 @@
 
 ## しくみ
 
-MOD の技術的なしくみは、プログラミングの経験がない人にも分かるように [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) で解説しています。
+MOD の技術的なしくみは、かなりゆるめに [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) で解説しています。
 
 要点は次のとおりです。
 
